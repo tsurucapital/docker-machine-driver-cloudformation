@@ -6,6 +6,7 @@ package main
  */
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -72,6 +73,8 @@ type Driver struct {
 	instanceSSHUser          string
 	sshPrivateKeyParamater   *string
 	sshPublicKeyParameter    *string
+	stackCreationTimeout     time.Duration
+	driverDebug              bool
 }
 
 // DriverName used to self-identify. Allows for clean-ups etc.
@@ -82,21 +85,23 @@ func (driver *Driver) DriverName() string {
 func (driver *Driver) getClientConfig() (*ClientConfig, error) {
 	if driver.clientConfig == nil {
 		sess := session.Must(session.NewSession())
+		config := &aws.Config{
+			Region: aws.String(driver.region),
+		}
+
+		if driver.driverDebug {
+			config.WithLogLevel(aws.LogDebugWithRequestRetries)
+		}
 
 		if driver.cloudformationRole != nil {
-			creds := stscreds.NewCredentials(sess, *driver.cloudformationRole)
-			driver.clientConfig = &ClientConfig{
-				session: sess,
-				config:  &aws.Config{Credentials: creds, Region: aws.String(driver.region)},
-			}
-		} else {
-			driver.clientConfig = &ClientConfig{
-				session: sess,
-				config:  &aws.Config{Region: aws.String(driver.region)},
-			}
+			config.Credentials = stscreds.NewCredentials(sess, *driver.cloudformationRole)
+		}
+
+		driver.clientConfig = &ClientConfig{
+			session: sess,
+			config:  config,
 		}
 	}
-
 	return driver.clientConfig, nil
 }
 
@@ -237,10 +242,10 @@ func (driver *Driver) Create() error {
 
 	stack, err := cfClient.CreateStack(&driver.CreateStackInput)
 	if err != nil {
-		log.Errorf("Failed to create %s stack.", *&driver.CreateStackInput.StackName)
+		log.Errorf("Failed to create %s stack.", *driver.CreateStackInput.StackName)
 		return err
 	}
-	log.Debugf("Created %s stack.", driver.CreateStackInput.StackName)
+	log.Debugf("Created %s stack, waiting for it to come up", *driver.CreateStackInput.StackName)
 
 	// Store the name so we can destroy it later. It's technically always
 	// available but we can check if we actually provisioned it quickly via a
@@ -251,12 +256,16 @@ func (driver *Driver) Create() error {
 		StackName: stack.StackId,
 	}
 
-	err = cfClient.WaitUntilStackCreateComplete(describeStack)
+	ctx, cancelFn := context.WithTimeout(context.Background(), driver.stackCreationTimeout)
+
+	defer cancelFn()
+
+	err = cfClient.WaitUntilStackCreateCompleteWithContext(ctx, describeStack)
 	if err != nil {
 		log.Errorf("Failed to wait for %s stack.", *describeStack.StackName)
 		return err
 	}
-	log.Debugf("Done waiting for %s stack.", describeStack.StackName)
+	log.Debugf("Done waiting for %s stack.", *describeStack.StackName)
 
 	// We have to wait for the stack to be ready, get IP address of the machine
 	// and the SSH user.
@@ -265,14 +274,14 @@ func (driver *Driver) Create() error {
 		log.Errorf("Failed to describe %s stack.", *describeStack.StackName)
 		return err
 	}
-	log.Debugf("Described %s stack.", describeStack.StackName)
+	log.Debugf("Described %s stack.", *describeStack.StackName)
 
 	// var createdStack cloudformation.Stack
 	// var stack cloudformation.Stack
 	var outputs []*cloudformation.Output
 	if len(stacksOutput.Stacks) > 0 {
 		outputs = stacksOutput.Stacks[0].Outputs
-		log.Debugf("Stack outputs: %+v.", outputs)
+		log.Debugf("Stack outputs: %+v", outputs)
 	} else {
 		return fmt.Errorf("no stacks returned with id %s", *stack.StackId)
 	}
@@ -287,6 +296,7 @@ func (driver *Driver) Create() error {
 	if spotFleetID == nil {
 		return fmt.Errorf("stack output didn't contain %s output", driver.spotFleetIDOutputName)
 	}
+	log.Debugf("Spot fleet output determined to be %s", *spotFleetID.OutputValue)
 
 	// We finally have outputs of the stack but the instance may still not be
 	// created of course. So now we query the spot fleet instances until we get
@@ -406,6 +416,15 @@ func (driver *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:  "cloudformation-ssh-public-key-parameter",
 			Usage: "SSM parameter name containing public part of SSH key pair.",
 		},
+		mcnflag.IntFlag{
+			Name:  "cloudformation-stack-creation-timeout",
+			Usage: "Number of seconds to wait for stack creation to complete",
+			Value: 300,
+		},
+		mcnflag.BoolFlag{
+			Name:  "cloudformation-driver-debug",
+			Usage: "Whether to turn debugging output on, regardless of docker-machine --debug.",
+		},
 	}
 }
 
@@ -483,12 +502,14 @@ func (driver *Driver) Restart() error {
 
 // SetConfigFromFlags assigns and verifies the command-line arguments presented to the driver.
 func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
-	log.Debugf("docker-machine-driver-cloudformation %s", DriverVersion)
+	driver.driverDebug = flags.Bool("cloudformation-driver-debug")
 
 	// Enable ALL logging if MACHINE_DEBUG is set
-	if os.Getenv("MACHINE_DEBUG") != "" {
+	if os.Getenv("MACHINE_DEBUG") != "" || driver.driverDebug {
 		stdlog.SetOutput(os.Stderr)
 	}
+
+	log.Debugf("docker-machine-driver-cloudformation %s", DriverVersion)
 
 	driver.CreateStackInput.SetTemplateURL(flags.String("cloudformation-template-url"))
 
@@ -516,6 +537,12 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	if public != "" {
 		driver.sshPublicKeyParameter = &public
 	}
+
+	timeout := time.Duration(flags.Int("cloudformation-stack-creation-timeout")) * time.Second
+	if timeout <= 0 {
+		return fmt.Errorf("Stack timeout duration has to be positive but got %f seconds", timeout.Seconds())
+	}
+	driver.stackCreationTimeout = timeout
 
 	return nil
 }
