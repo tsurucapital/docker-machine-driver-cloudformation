@@ -367,7 +367,7 @@ func (driver *Driver) GetURL() (string, error) {
 
 // Kill the target machine (hard shutdown).
 func (driver *Driver) Kill() error {
-	return errors.New("the Terraform driver does not support Kill")
+	return errors.New("the CloudFormation driver does not support Kill")
 }
 
 // Remove deletes the target machine.
@@ -484,10 +484,10 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 
 // Start the target machine.
 func (driver *Driver) Start() error {
-	return errors.New("the Terraform driver does not support Start")
+	return errors.New("the CloudFormation driver does not support Start")
 }
 
 // Stop the target machine (gracefully).
 func (driver *Driver) Stop() error {
-	return errors.New("the Terraform driver does not support Stop")
+	return errors.New("the CloudFormation driver does not support Stop")
 }
