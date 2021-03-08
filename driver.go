@@ -568,17 +568,17 @@ func (driver *Driver) GetState() (state.State, error) {
 
 	// From AWS docs, 0 = pending, 16 = running, 32 = shutting-down, 48 =
 	// terminated, 64 = stopping and 80 = stopped
-	if code&1 == 0 {
+	if code == 0 {
 		return state.Starting, nil
-	} else if code&16 == 16 {
+	} else if code == 16 {
 		return state.Running, nil
-	} else if code&32 == 32 {
+	} else if code == 32 {
 		return state.Stopping, nil
-	} else if code&48 == 48 {
+	} else if code == 48 {
 		return state.Stopped, nil
-	} else if code&64 == 64 {
+	} else if code == 64 {
 		return state.Stopping, nil
-	} else if code&80 == 80 {
+	} else if code == 80 {
 		return state.Stopped, nil
 	}
 
