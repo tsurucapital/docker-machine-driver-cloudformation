@@ -90,7 +90,7 @@ func (driver *Driver) getClientConfig() (*ClientConfig, error) {
 		}
 
 		if driver.driverDebug {
-			config.WithLogLevel(aws.LogDebugWithRequestRetries)
+			config.WithLogLevel(aws.LogDebug)
 		}
 
 		if driver.cloudformationRole != nil {
