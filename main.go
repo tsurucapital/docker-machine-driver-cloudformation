@@ -29,7 +29,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.1"
+var DriverVersion = "0.1.1"
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
