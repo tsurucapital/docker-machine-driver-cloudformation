@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/docker/machine/libmachine/drivers"
@@ -29,7 +30,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.7.0"
+var DriverVersion = "0.8.0"
 
 // ClientConfig comment
 type ClientConfig struct {
@@ -40,7 +41,6 @@ type ClientConfig struct {
 // Driver comment??
 type Driver struct {
 	*drivers.BaseDriver
-	CreateStackInput         cloudformation.CreateStackInput
 	cloudformation           *cloudformation.CloudFormation
 	ec2                      *ec2.EC2
 	ssm                      *ssm.SSM
@@ -56,9 +56,12 @@ type Driver struct {
 	InstanceStopTimeout      time.Duration
 
 	StackName          *string
+	StackTemplateURL   string
 	InstanceID         *string
 	Region             *string
 	CloudFormationRole *string
+
+	StackTags []*cloudformation.Tag
 }
 
 // StateFile ensures that directory for a state file exists and returns the path
@@ -232,27 +235,27 @@ func (driver *Driver) Create() error {
 		return err
 	}
 
+	CreateStackInput := cloudformation.CreateStackInput{}
 	// Before we create stack, we have to set then name and bunch of parameters.
-	driver.CreateStackInput.SetStackName(driver.MachineName)
+	CreateStackInput.SetStackName(driver.MachineName)
 	stackParameters := []*cloudformation.Parameter{
 		{
 			ParameterKey:   &driver.MachineNameParameterName,
 			ParameterValue: &driver.MachineName,
 		},
 	}
-	driver.CreateStackInput.SetParameters(stackParameters)
+	CreateStackInput.SetParameters(stackParameters)
+	CreateStackInput.SetTags(driver.StackTags)
 
-	stack, err := cfClient.CreateStack(&driver.CreateStackInput)
+	stack, err := cfClient.CreateStack(&CreateStackInput)
 	if err != nil {
-		log.Errorf("Failed to create %s stack.", *driver.CreateStackInput.StackName)
+		log.Errorf("Failed to create %s stack.", *CreateStackInput.StackName)
 		return err
 	}
-	log.Debugf("Created %s stack, waiting for it to come up", *driver.CreateStackInput.StackName)
+	log.Debugf("Created %s stack, waiting for it to come up", *CreateStackInput.StackName)
 
-	// Store the name so we can destroy it later. It's technically always
-	// available but we can check if we actually provisioned it quickly via a
-	// second field.
-	driver.StackName = driver.CreateStackInput.StackName
+	// Store the name so we can destroy it later.
+	driver.StackName = CreateStackInput.StackName
 	if err != nil {
 		return err
 	}
@@ -445,6 +448,11 @@ func (driver *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage: "Number of seconds to wait for instance to start if requested.",
 			Value: 300,
 		},
+		mcnflag.StringSliceFlag{
+			Name:  "cloudformation-stack-tag",
+			Usage: "Key=<name>,Value=<val>",
+			Value: []string{},
+		},
 	}
 }
 
@@ -574,7 +582,7 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 
 	log.Debugf("docker-machine-driver-cloudformation %s", DriverVersion)
 
-	driver.CreateStackInput.SetTemplateURL(flags.String("cloudformation-template-url"))
+	driver.StackTemplateURL = flags.String("cloudformation-template-url")
 
 	role := flags.String("cloudformation-creation-role")
 	// We only set the role if it's set to some value. It's easier to work with
@@ -607,7 +615,34 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	driver.InstanceStopTimeout = time.Duration(flags.Int("cloudformation-instance-stop-timeout")) * time.Second
 	driver.InstanceStartTimeout = time.Duration(flags.Int("cloudformation-instance-start-timeout")) * time.Second
 
+	tags := flags.StringSlice("cloudformation-stack-tag")
+	for _, tagStr := range tags {
+		tag, err := ParseTag(tagStr)
+		if err != nil {
+			return err
+		}
+		driver.StackTags = append(driver.StackTags, tag)
+	}
+
 	return nil
+}
+
+// ParseTag parses some AWS-style tags but only one at a time.
+func ParseTag(input string) (*cloudformation.Tag, error) {
+	r := regexp.MustCompile(`Key=(.+),Value=(.+)`)
+	match := r.FindStringSubmatch(input)
+	if match == nil {
+		return nil, fmt.Errorf("Could not parse %s as a tag, no match., %v", input, match)
+	}
+	// [0] seems to have the original string..?
+	if len(match) != 3 {
+		return nil, fmt.Errorf("Could not parse %s as a tag, got %d matches., %v", input, len(match), match)
+	}
+	tag := &cloudformation.Tag{
+		Key:   &match[1],
+		Value: &match[2],
+	}
+	return tag, nil
 }
 
 // Start the target machine.
