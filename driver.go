@@ -29,7 +29,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.6.0"
+var DriverVersion = "0.7.0"
 
 // ClientConfig comment
 type ClientConfig struct {
