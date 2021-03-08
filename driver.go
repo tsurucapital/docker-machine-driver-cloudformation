@@ -7,7 +7,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	stdlog "log"
@@ -38,15 +37,6 @@ type ClientConfig struct {
 	config  *aws.Config
 }
 
-// PersistentState is state that we want to persist across runs.
-type PersistentState struct {
-	StackName          *string
-	InstanceID         *string
-	InstanceIP         *string
-	Region             *string
-	CloudFormationRole *string
-}
-
 // Driver comment??
 type Driver struct {
 	*drivers.BaseDriver
@@ -54,18 +44,21 @@ type Driver struct {
 	cloudformation           *cloudformation.CloudFormation
 	ec2                      *ec2.EC2
 	ssm                      *ssm.SSM
-	machineNameParameterName string
+	MachineNameParameterName string
 	spotFleetIDOutputName    string
 	clientConfig             *ClientConfig
-	instanceSSHUser          string
-	sshPrivateKeyParamater   *string
-	sshPublicKeyParameter    *string
-	stackCreationTimeout     time.Duration
+	InstanceSSHUser          string
+	SSHPrivateKeyParameter   *string
+	SSHPublicKeyParameter    *string
+	StackCreationTimeout     time.Duration
 	driverDebug              bool
-	instanceStartTimeout     time.Duration
-	instanceStopTimeout      time.Duration
+	InstanceStartTimeout     time.Duration
+	InstanceStopTimeout      time.Duration
 
-	state PersistentState
+	StackName          *string
+	InstanceID         *string
+	Region             *string
+	CloudFormationRole *string
 }
 
 // StateFile ensures that directory for a state file exists and returns the path
@@ -82,72 +75,6 @@ func (driver *Driver) StateFile() (*string, error) {
 	return &stateFile, nil
 }
 
-// SaveState serialises any existing persistent state to disk, for reading
-// later.
-func (driver *Driver) SaveState() error {
-	jsonData, err := json.MarshalIndent(driver.state, "", "    ")
-	if err != nil {
-		return err
-	}
-	stateFile, err := driver.StateFile()
-	if err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(*stateFile, jsonData, 0600)
-}
-
-// LoadState loads 'StateFile()' if it exists and sets the state in the driver.
-// If the state file doesn't exist, no state modification is done. Errors if
-// there's an issue reading the file.
-func (driver *Driver) LoadState() error {
-	stateFile, err := driver.StateFile()
-	if err != nil {
-		return err
-	}
-	if _, err = os.Stat(*stateFile); os.IsNotExist(err) {
-		log.Debug("State file didn't exist, not over-writing state.")
-		return nil
-	}
-	// File exists so let's try to read it.
-	jsonData, err := ioutil.ReadFile(*stateFile)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(jsonData, &driver.state)
-}
-
-// SetCreatedStackName sets the name of created stack and saves the state file.
-func (driver *Driver) SetCreatedStackName(stackName *string) error {
-	driver.state.StackName = stackName
-	return driver.SaveState()
-}
-
-// SetCreatedInstanceID sets the ID of created instance and saves the state file.
-func (driver *Driver) SetCreatedInstanceID(instanceID *string) error {
-	driver.state.InstanceID = instanceID
-	return driver.SaveState()
-}
-
-// SetCreatedInstanceIP sets the ID of created instance and saves the state file.
-func (driver *Driver) SetCreatedInstanceIP(instanceIP *string) error {
-	driver.IPAddress = *instanceIP
-	driver.state.InstanceIP = instanceIP
-	return driver.SaveState()
-}
-
-// SetRegion sets the region being used and saves the state file.
-func (driver *Driver) SetRegion(region *string) error {
-	driver.state.Region = region
-	return driver.SaveState()
-}
-
-// SetCloudFormationRole saves the cloud formation role to the state.
-func (driver *Driver) SetCloudFormationRole(role *string) error {
-	driver.state.CloudFormationRole = role
-	return driver.SaveState()
-}
-
 // DriverName used to self-identify. Allows for clean-ups etc.
 func (driver *Driver) DriverName() string {
 	return "cloudformation"
@@ -156,24 +83,20 @@ func (driver *Driver) DriverName() string {
 func (driver *Driver) getClientConfig() (*ClientConfig, error) {
 	if driver.clientConfig == nil {
 		sess := session.Must(session.NewSession())
-		err := driver.LoadState()
-		if err != nil {
-			return nil, err
-		}
-		if driver.state.Region == nil {
+		if driver.Region == nil {
 			return nil, fmt.Errorf("region not set in driver state")
 		}
 
 		config := &aws.Config{
-			Region: aws.String(*driver.state.Region),
+			Region: aws.String(*driver.Region),
 		}
 
 		if driver.driverDebug {
 			config.WithLogLevel(aws.LogDebug)
 		}
 
-		if driver.state.CloudFormationRole != nil {
-			config.Credentials = stscreds.NewCredentials(sess, *driver.state.CloudFormationRole)
+		if driver.CloudFormationRole != nil {
+			config.Credentials = stscreds.NewCredentials(sess, *driver.CloudFormationRole)
 		}
 
 		driver.clientConfig = &ClientConfig{
@@ -224,11 +147,11 @@ func (driver *Driver) getSsmClient() (*ssm.SSM, error) {
 
 // PreCreateCheck verifies some flag values.
 func (driver *Driver) PreCreateCheck() error {
-	if driver.sshPrivateKeyParamater == nil {
+	if driver.SSHPrivateKeyParameter == nil {
 		return fmt.Errorf("Private SSH key parameter has to be set, check --help")
 	}
 
-	if driver.sshPublicKeyParameter == nil {
+	if driver.SSHPublicKeyParameter == nil {
 		return fmt.Errorf("Public SSH key parameter has to be set, check --help")
 	}
 
@@ -249,12 +172,12 @@ func (driver *Driver) Create() error {
 
 	WithDecryption := true
 	private, err := ssmClient.GetParameter(&ssm.GetParameterInput{
-		Name:           driver.sshPrivateKeyParamater,
+		Name:           driver.SSHPrivateKeyParameter,
 		WithDecryption: &WithDecryption,
 	})
 
 	if err != nil {
-		log.Errorf("Failed to read the %s parameter.", *driver.sshPrivateKeyParamater)
+		log.Errorf("Failed to read the %s parameter.", *driver.SSHPrivateKeyParameter)
 		return err
 	}
 
@@ -281,11 +204,11 @@ func (driver *Driver) Create() error {
 	driver.SSHKeyPath = dest
 
 	public, err := ssmClient.GetParameter(&ssm.GetParameterInput{
-		Name:           driver.sshPublicKeyParameter,
+		Name:           driver.SSHPublicKeyParameter,
 		WithDecryption: &WithDecryption,
 	})
 	if err != nil {
-		log.Errorf("Failed to read the %s parameter.", *driver.sshPublicKeyParameter)
+		log.Errorf("Failed to read the %s parameter.", *driver.SSHPublicKeyParameter)
 		return err
 	}
 
@@ -313,7 +236,7 @@ func (driver *Driver) Create() error {
 	driver.CreateStackInput.SetStackName(driver.MachineName)
 	stackParameters := []*cloudformation.Parameter{
 		{
-			ParameterKey:   &driver.machineNameParameterName,
+			ParameterKey:   &driver.MachineNameParameterName,
 			ParameterValue: &driver.MachineName,
 		},
 	}
@@ -329,7 +252,7 @@ func (driver *Driver) Create() error {
 	// Store the name so we can destroy it later. It's technically always
 	// available but we can check if we actually provisioned it quickly via a
 	// second field.
-	err = driver.SetCreatedStackName(driver.CreateStackInput.StackName)
+	driver.StackName = driver.CreateStackInput.StackName
 	if err != nil {
 		return err
 	}
@@ -338,10 +261,10 @@ func (driver *Driver) Create() error {
 		StackName: stack.StackId,
 	}
 
-	if driver.stackCreationTimeout.Seconds() <= 0 {
-		return fmt.Errorf("Stack timeout duration has to be positive but got %f seconds", driver.stackCreationTimeout.Seconds())
+	if driver.StackCreationTimeout.Seconds() <= 0 {
+		return fmt.Errorf("Stack timeout duration has to be positive but got %f seconds", driver.StackCreationTimeout.Seconds())
 	}
-	ctx, cancelFn := context.WithTimeout(context.Background(), driver.stackCreationTimeout)
+	ctx, cancelFn := context.WithTimeout(context.Background(), driver.StackCreationTimeout)
 
 	defer cancelFn()
 
@@ -428,7 +351,7 @@ func (driver *Driver) Create() error {
 		return fmt.Errorf("internal error, expected worker instance to be available at this point")
 	}
 
-	driver.SetCreatedInstanceID(workerInstance.InstanceId)
+	driver.InstanceID = workerInstance.InstanceId
 
 	params := &ec2.DescribeInstancesInput{
 		InstanceIds: []*string{aws.String(*workerInstance.InstanceId)},
@@ -456,8 +379,8 @@ func (driver *Driver) Create() error {
 
 	log.Debugf("Instance was launched with IP %s", *instance.PrivateIpAddress)
 
-	driver.SetCreatedInstanceIP(*&instance.PrivateIpAddress)
-	driver.SSHUser = driver.instanceSSHUser
+	driver.IPAddress = *instance.PrivateIpAddress
+	driver.SSHUser = driver.InstanceSSHUser
 
 	return nil
 }
@@ -527,26 +450,16 @@ func (driver *Driver) GetCreateFlags() []mcnflag.Flag {
 
 // GetSSHHostname returns the hostname for SSH
 func (driver *Driver) GetSSHHostname() (string, error) {
-	err := driver.LoadState()
-	if err != nil {
-		return "", err
-	}
-
-	if driver.state.InstanceIP == nil {
+	if driver.IPAddress == "" {
 		return "", fmt.Errorf("we don't know the instance IP")
 	}
 
-	return *driver.state.InstanceIP, nil
+	return driver.IPAddress, nil
 }
 
 // GetState retrieves the status of the target Docker Machine instance in CloudControl.
 func (driver *Driver) GetState() (state.State, error) {
-	err := driver.LoadState()
-	if err != nil {
-		return state.None, err
-	}
-
-	if driver.state.InstanceID == nil {
+	if driver.InstanceID == nil {
 		return state.None, fmt.Errorf("we don't know the instance ID so can't get the status")
 	}
 
@@ -556,13 +469,13 @@ func (driver *Driver) GetState() (state.State, error) {
 	}
 
 	resp, err := ec2Client.DescribeInstanceStatus(&ec2.DescribeInstanceStatusInput{
-		InstanceIds: []*string{driver.state.InstanceID},
+		InstanceIds: []*string{driver.InstanceID},
 	})
 	if err != nil {
 		return state.None, err
 	}
 	if len(resp.InstanceStatuses) != 1 {
-		return state.None, fmt.Errorf("Expected exactly one instance status for %s but got %+v", *driver.state.InstanceID, resp.InstanceStatuses)
+		return state.None, fmt.Errorf("Expected exactly one instance status for %s but got %+v", *driver.InstanceID, resp.InstanceStatuses)
 	}
 	code := *resp.InstanceStatuses[0].InstanceState.Code
 
@@ -607,11 +520,7 @@ func (driver *Driver) Kill() error {
 func (driver *Driver) Remove() error {
 	log.Infof("Destroying resources...")
 
-	err := driver.LoadState()
-	if err != nil {
-		return err
-	}
-	if driver.state.StackName == nil {
+	if driver.StackName == nil {
 		log.Warnf("no CloudFormation stack found in driver state, not destroying anything")
 		return nil
 	}
@@ -619,38 +528,36 @@ func (driver *Driver) Remove() error {
 	cfClient, err := driver.getCloudFormationClient()
 
 	if err != nil {
-		log.Errorf("Unable to get CloudFormation client, CF stack %s may be left behind.", *driver.state.StackName)
+		log.Errorf("Unable to get CloudFormation client, CF stack %s may be left behind.", *driver.StackName)
 		return err
 	}
 
 	_, err = cfClient.DeleteStack(&cloudformation.DeleteStackInput{
-		RoleARN:   driver.state.CloudFormationRole,
-		StackName: driver.state.StackName,
+		RoleARN:   driver.CloudFormationRole,
+		StackName: driver.StackName,
 	})
 
 	if err != nil {
-		log.Errorf("Deleting %s stack failed, resources may have been left behind.", *driver.state.StackName)
+		log.Errorf("Deleting %s stack failed, resources may have been left behind.", *driver.StackName)
 		return err
 	}
 
-	driver.state = PersistentState{}
-	return driver.SaveState()
+	driver.IPAddress = ""
+	driver.StackName = nil
+	driver.InstanceID = nil
+
+	return nil
 }
 
 // Restart the target machine.
 func (driver *Driver) Restart() error {
-	err := driver.LoadState()
-	if err != nil {
-		return nil
-	}
-
 	// We can check if machine is running but not bothering right now... We'll
 	// just check if we know of one at least.
-	if driver.state.InstanceIP == nil {
+	if driver.IPAddress == "" {
 		return fmt.Errorf("we don't know the instance IP so we can't reboot")
 	}
 
-	_, err = drivers.RunSSHCommandFromDriver(driver, "sudo shutdown -r now")
+	_, err := drivers.RunSSHCommandFromDriver(driver, "sudo shutdown -r now")
 
 	return err
 }
@@ -672,43 +579,39 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	// We only set the role if it's set to some value. It's easier to work with
 	// nil as bunch of places in the API expect pointers.
 	if role != "" {
-		driver.SetCloudFormationRole(&role)
+		driver.CloudFormationRole = &role
 	}
 
 	region := flags.String("cloudformation-region")
-	driver.SetRegion(&region)
+	driver.Region = &region
 
-	driver.instanceSSHUser = flags.String("cloudformation-instance-ssh-user")
+	driver.InstanceSSHUser = flags.String("cloudformation-instance-ssh-user")
 
-	driver.machineNameParameterName = flags.String("cloudformation-machine-name-parameter-name")
+	driver.MachineNameParameterName = flags.String("cloudformation-machine-name-parameter-name")
 
 	driver.spotFleetIDOutputName = flags.String("cloudformation-spot-fleet-id-output-name")
 
 	private := flags.String("cloudformation-ssh-private-key-parameter")
 	if private != "" {
-		driver.sshPrivateKeyParamater = &private
+		driver.SSHPrivateKeyParameter = &private
 	}
 
 	public := flags.String("cloudformation-ssh-public-key-parameter")
 	if public != "" {
-		driver.sshPublicKeyParameter = &public
+		driver.SSHPublicKeyParameter = &public
 	}
 
-	driver.stackCreationTimeout = time.Duration(flags.Int("cloudformation-stack-creation-timeout")) * time.Second
+	driver.StackCreationTimeout = time.Duration(flags.Int("cloudformation-stack-creation-timeout")) * time.Second
 
-	driver.instanceStopTimeout = time.Duration(flags.Int("cloudformation-instance-stop-timeout")) * time.Second
-	driver.instanceStartTimeout = time.Duration(flags.Int("cloudformation-instance-start-timeout")) * time.Second
+	driver.InstanceStopTimeout = time.Duration(flags.Int("cloudformation-instance-stop-timeout")) * time.Second
+	driver.InstanceStartTimeout = time.Duration(flags.Int("cloudformation-instance-start-timeout")) * time.Second
 
 	return nil
 }
 
 // Start the target machine.
 func (driver *Driver) Start() error {
-	err := driver.LoadState()
-	if err != nil {
-		return err
-	}
-	if driver.state.InstanceID == nil {
+	if driver.InstanceID == nil {
 		return fmt.Errorf("no instance ID found in the state")
 	}
 
@@ -718,20 +621,20 @@ func (driver *Driver) Start() error {
 	}
 
 	_, err = ec2Client.StartInstances(&ec2.StartInstancesInput{
-		InstanceIds: []*string{driver.state.InstanceID},
+		InstanceIds: []*string{driver.InstanceID},
 	})
 	if err != nil {
 		return err
 	}
 
-	if driver.instanceStartTimeout.Seconds() <= 0 {
-		return fmt.Errorf("Instance stop timeout duration has to be positive but got %f seconds", driver.instanceStartTimeout.Seconds())
+	if driver.InstanceStartTimeout.Seconds() <= 0 {
+		return fmt.Errorf("Instance stop timeout duration has to be positive but got %f seconds", driver.InstanceStartTimeout.Seconds())
 	}
-	ctx, cancelFn := context.WithTimeout(context.Background(), driver.instanceStartTimeout)
+	ctx, cancelFn := context.WithTimeout(context.Background(), driver.InstanceStartTimeout)
 	defer cancelFn()
 
 	return ec2Client.WaitUntilInstanceRunningWithContext(ctx, &ec2.DescribeInstancesInput{
-		InstanceIds: []*string{driver.state.InstanceID},
+		InstanceIds: []*string{driver.InstanceID},
 	})
 }
 
@@ -743,11 +646,7 @@ func (driver *Driver) Stop() error {
 // StopInstance stops underlying EC2 instance, forcefully or not depending on
 // what the user wanted.
 func (driver *Driver) StopInstance(force bool) error {
-	err := driver.LoadState()
-	if err != nil {
-		return err
-	}
-	if driver.state.InstanceID == nil {
+	if driver.InstanceID == nil {
 		return fmt.Errorf("no instance ID found in the state")
 	}
 
@@ -758,20 +657,20 @@ func (driver *Driver) StopInstance(force bool) error {
 
 	_, err = ec2Client.StopInstances(&ec2.StopInstancesInput{
 		Force:       &force,
-		InstanceIds: []*string{driver.state.InstanceID},
+		InstanceIds: []*string{driver.InstanceID},
 	})
 	if err != nil {
 		return err
 	}
 
-	if driver.instanceStopTimeout.Seconds() <= 0 {
-		return fmt.Errorf("Instance stop timeout duration has to be positive but got %f seconds", driver.instanceStopTimeout.Seconds())
+	if driver.InstanceStopTimeout.Seconds() <= 0 {
+		return fmt.Errorf("Instance stop timeout duration has to be positive but got %f seconds", driver.InstanceStopTimeout.Seconds())
 	}
-	ctx, cancelFn := context.WithTimeout(context.Background(), driver.instanceStopTimeout)
+	ctx, cancelFn := context.WithTimeout(context.Background(), driver.InstanceStopTimeout)
 	defer cancelFn()
 
 	// Might want a timeout flag here.
 	return ec2Client.WaitUntilInstanceStoppedWithContext(ctx, &ec2.DescribeInstancesInput{
-		InstanceIds: []*string{driver.state.InstanceID},
+		InstanceIds: []*string{driver.InstanceID},
 	})
 }
