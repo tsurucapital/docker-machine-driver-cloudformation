@@ -477,6 +477,7 @@ func (driver *Driver) GetState() (state.State, error) {
 	if len(resp.InstanceStatuses) != 1 {
 		return state.None, fmt.Errorf("Expected exactly one instance status for %s but got %+v", *driver.InstanceID, resp.InstanceStatuses)
 	}
+	log.Debugf("Got instance statuses %+v", resp.InstanceStatuses)
 	code := *resp.InstanceStatuses[0].InstanceState.Code
 
 	// From AWS docs, 0 = pending, 16 = running, 32 = shutting-down, 48 =
