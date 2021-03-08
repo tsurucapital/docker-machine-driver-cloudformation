@@ -29,7 +29,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.1.1"
+var DriverVersion = "0.2.0"
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
@@ -62,7 +62,6 @@ type Driver struct {
 	ec2                      *ec2.EC2
 	region                   string
 	machineNameParameterName string
-	keyNameParameterName     string
 	spotFleetIDOutputName    string
 	cloudformationRole       *string
 	cloudformationStackName  *string
@@ -162,10 +161,6 @@ func (driver *Driver) Create() error {
 	// Before we create stack, we have to set then name and bunch of parameters.
 	driver.CreateStackInput.SetStackName(driver.MachineName)
 	stackParameters := []*cloudformation.Parameter{
-		{
-			ParameterKey:   &driver.keyNameParameterName,
-			ParameterValue: key.KeyName,
-		},
 		{
 			ParameterKey:   &driver.machineNameParameterName,
 			ParameterValue: &driver.MachineName,
@@ -327,11 +322,6 @@ func (driver *Driver) GetCreateFlags() []mcnflag.Flag {
 			Value: "ubuntu",
 		},
 		mcnflag.StringFlag{
-			Name:  "cloudformation-key-name-parameter-name",
-			Usage: "Parameter name in CF stack of the SSH key pair.",
-			Value: "KeyName",
-		},
-		mcnflag.StringFlag{
 			Name:  "cloudformation-machine-name-parameter-name",
 			Usage: "Parameter name in CF stack of the machine name.",
 			Value: "MachineName",
@@ -485,7 +475,6 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 
 	driver.instanceSSHUser = flags.String("cloudformation-instance-ssh-user")
 
-	driver.keyNameParameterName = flags.String("cloudformation-key-name-parameter-name")
 	driver.machineNameParameterName = flags.String("cloudformation-machine-name-parameter-name")
 
 	driver.spotFleetIDOutputName = flags.String("cloudformation-spot-fleet-id-output-name")
