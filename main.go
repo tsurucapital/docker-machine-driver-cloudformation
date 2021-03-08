@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"time"
 
 	"github.com/docker/machine/libmachine/drivers"
@@ -26,10 +27,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/ssm"
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.2.0"
+var DriverVersion = "0.3.0"
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
@@ -60,16 +62,21 @@ type Driver struct {
 	CreateStackInput         cloudformation.CreateStackInput
 	cloudformation           *cloudformation.CloudFormation
 	ec2                      *ec2.EC2
+	ssm                      *ssm.SSM
 	region                   string
 	machineNameParameterName string
 	spotFleetIDOutputName    string
 	cloudformationRole       *string
 	cloudformationStackName  *string
-	keyPairID                *string
 	clientConfig             *ClientConfig
 	instanceSSHUser          string
-	sshPrivateKeyPath        *string
-	sshPublicKeyPath         *string
+	sshPrivateKeyParamater   *string
+	sshPublicKeyParameter    *string
+}
+
+// DriverName used to self-identify. Allows for clean-ups etc.
+func (driver *Driver) DriverName() string {
+	return "cloudformation"
 }
 
 func (driver *Driver) getClientConfig() (*ClientConfig, error) {
@@ -119,38 +126,98 @@ func (driver *Driver) getEc2Client() (*ec2.EC2, error) {
 	return driver.ec2, nil
 }
 
+func (driver *Driver) getSsmClient() (*ssm.SSM, error) {
+	if driver.ssm == nil {
+		config, err := driver.getClientConfig()
+		if err != nil {
+			return nil, err
+		}
+
+		driver.ssm = ssm.New(config.session, config.config)
+	}
+	return driver.ssm, nil
+}
+
+// PreCreateCheck verifies some flag values.
+func (driver *Driver) PreCreateCheck() error {
+	if driver.sshPrivateKeyParamater == nil {
+		return fmt.Errorf("Private SSH key parameter has to be set, check --help")
+	}
+
+	if driver.sshPublicKeyParameter == nil {
+		return fmt.Errorf("Public SSH key parameter has to be set, check --help")
+	}
+
+	return nil
+}
+
 // Create register a SSH key pair, applies CloudFormation stack and waits until
 // an instance is ready.
 func (driver *Driver) Create() error {
 	log.Infof("Creating resources...")
 
-	// We need import the SSH key given to use by the driver into AWS so that we
-	// can use it during stack creation.
-	sshKey, err := ioutil.ReadFile(driver.GetSSHKeyPath())
+	// We start by importing private and public keys into the docker machine
+	// directory.
+	ssmClient, err := driver.getSsmClient()
 	if err != nil {
-		log.Errorf("Failed to read SSH key from %s.", driver.GetSSHKeyPath())
 		return err
 	}
+
+	WithDecryption := true
+	private, err := ssmClient.GetParameter(&ssm.GetParameterInput{
+		Name:           driver.sshPrivateKeyParamater,
+		WithDecryption: &WithDecryption,
+	})
+
+	if err != nil {
+		log.Errorf("Failed to read the %s parameter.", *driver.sshPrivateKeyParamater)
+		return err
+	}
+
+	dest := driver.GetSSHKeyPath()
+	destDir := filepath.Dir(dest)
+	// Usually the directory doesn't exist at this point so we have to make it.
+	if _, err = os.Stat(destDir); os.IsNotExist(err) {
+		err = os.MkdirAll(filepath.Dir(destDir), 0744)
+		if err != nil {
+			log.Errorf("Failed to make directory for SSH keys at %s", destDir)
+			return err
+		}
+		log.Debugf("Created %s for SSH keys", destDir)
+	}
+
+	// We should have the directory now, write the private part of the SSH key.
+	err = ioutil.WriteFile(dest, []byte(*private.Parameter.Value), 0400)
+	if err != nil {
+		log.Errorf("Failed to write private part of ssh key to %s", dest)
+		return err
+	}
+	log.Debugf("Wrote private part of SSH key to %s", dest)
+	// Set the path for good measure though I think it doesn't make a difference?
+	driver.SSHKeyPath = dest
+
+	public, err := ssmClient.GetParameter(&ssm.GetParameterInput{
+		Name:           driver.sshPublicKeyParameter,
+		WithDecryption: &WithDecryption,
+	})
+	if err != nil {
+		log.Errorf("Failed to read the %s parameter.", *driver.sshPublicKeyParameter)
+		return err
+	}
+
+	publicDest := dest + ".pub"
+	err = ioutil.WriteFile(publicDest, []byte(*public.Parameter.Value), 0400)
+	if err != nil {
+		log.Errorf("Failed to write public part of ssh key to %s", publicDest)
+		return err
+	}
+	log.Debugf("Wrote public part of SSH key to %s", publicDest)
 
 	ec2Client, err := driver.getEc2Client()
 	if err != nil {
 		log.Errorf("Failed to get EC2 client.")
 		return err
 	}
-
-	key, err := ec2Client.ImportKeyPair(&ec2.ImportKeyPairInput{
-		KeyName:           &driver.MachineName,
-		PublicKeyMaterial: sshKey,
-	})
-	if err != nil {
-		log.Errorf("Importing key pair into AWS failed.")
-		return nil
-	}
-	log.Debugf("Imported %s key pair into AWS.", *key.KeyName)
-	// Store the key pair name so we can destroy it later. It's technically always
-	// available but we can check if we actually provisioned it quickly via a
-	// second field.
-	driver.keyPairID = key.KeyPairId
 
 	cfClient, err := driver.getCloudFormationClient()
 	if err != nil {
@@ -373,18 +440,7 @@ func (driver *Driver) Kill() error {
 // Remove deletes the target machine.
 func (driver *Driver) Remove() error {
 	log.Infof("Destroying resources...")
-
-	cfErr := driver.DestroyCloudFormationStack()
-
-	if cfErr != nil {
-		// Even if CF failed, let's try to at least remove the key pair
-		_ = driver.DestroyKeyPair()
-		// Even if key pair stuff failed too, let's just keep the original error.
-		return cfErr
-	}
-
-	// Stack deleted OK, let's delete the key pair
-	return driver.DestroyKeyPair()
+	return driver.DestroyCloudFormationStack()
 }
 
 // DestroyCloudFormationStack destroys the CF stack if it exists
@@ -412,34 +468,6 @@ func (driver *Driver) DestroyCloudFormationStack() error {
 	}
 
 	driver.cloudformationStackName = nil
-
-	return nil
-}
-
-// DestroyKeyPair destroys the imported key pair resource if it exists
-func (driver *Driver) DestroyKeyPair() error {
-	if driver.keyPairID == nil {
-		log.Warnf("No key pair found in driver state, not destroying anything")
-		return nil
-	}
-
-	ec2Client, err := driver.getEc2Client()
-
-	if err != nil {
-		log.Errorf("Unable to get EC2 client, SSH key pair %s may be left behind", *driver.keyPairID)
-		return err
-	}
-
-	_, err = ec2Client.DeleteKeyPair(&ec2.DeleteKeyPairInput{
-		KeyPairId: driver.keyPairID,
-	})
-
-	if err != nil {
-		log.Errorf("Failed to destroy key pair %s, resource may be left behind", *driver.keyPairID)
-		return err
-	}
-
-	driver.keyPairID = nil
 
 	return nil
 }
@@ -478,6 +506,16 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	driver.machineNameParameterName = flags.String("cloudformation-machine-name-parameter-name")
 
 	driver.spotFleetIDOutputName = flags.String("cloudformation-spot-fleet-id-output-name")
+
+	private := flags.String("cloudformation-ssh-private-key-parameter")
+	if private != "" {
+		driver.sshPrivateKeyParamater = &private
+	}
+
+	public := flags.String("cloudformation-ssh-public-key-parameter")
+	if public != "" {
+		driver.sshPublicKeyParameter = &public
+	}
 
 	return nil
 }
