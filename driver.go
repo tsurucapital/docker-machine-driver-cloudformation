@@ -30,7 +30,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.5.0"
+var DriverVersion = "0.6.0"
 
 // ClientConfig comment
 type ClientConfig struct {
@@ -423,7 +423,7 @@ func (driver *Driver) Create() error {
 	var instance *ec2.Instance
 	for _, res := range resp.Reservations {
 		for _, i := range res.Instances {
-			if i.InstanceId == workerInstance.InstanceId {
+			if *i.InstanceId == *workerInstance.InstanceId {
 				instance = i
 				break
 			}
@@ -431,7 +431,7 @@ func (driver *Driver) Create() error {
 	}
 
 	if instance == nil {
-		return fmt.Errorf("expected to find instance with ID %s but it was missing", *workerInstance.InstanceId)
+		return fmt.Errorf("expected to find instance with ID %s but it was missing from %+v", *workerInstance.InstanceId, resp.Reservations)
 	}
 
 	log.Debugf("Instance was launched with IP %s", *instance.PrivateIpAddress)
