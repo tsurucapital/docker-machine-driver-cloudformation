@@ -288,7 +288,7 @@ func (driver *Driver) Create() error {
 
 	var spotFleetID *cloudformation.Output
 	for _, output := range outputs {
-		if output.OutputKey == &driver.spotFleetIDOutputName {
+		if *output.OutputKey == driver.spotFleetIDOutputName {
 			spotFleetID = output
 		}
 	}
