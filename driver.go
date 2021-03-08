@@ -40,9 +40,11 @@ type ClientConfig struct {
 
 // PersistentState is state that we want to persist across runs.
 type PersistentState struct {
-	StackName  *string
-	InstanceID *string
-	InstanceIP *string
+	StackName          *string
+	InstanceID         *string
+	InstanceIP         *string
+	Region             *string
+	CloudFormationRole *string
 }
 
 // Driver comment??
@@ -52,10 +54,8 @@ type Driver struct {
 	cloudformation           *cloudformation.CloudFormation
 	ec2                      *ec2.EC2
 	ssm                      *ssm.SSM
-	region                   string
 	machineNameParameterName string
 	spotFleetIDOutputName    string
-	cloudformationRole       *string
 	clientConfig             *ClientConfig
 	instanceSSHUser          string
 	sshPrivateKeyParamater   *string
@@ -136,6 +136,18 @@ func (driver *Driver) SetCreatedInstanceIP(instanceIP *string) error {
 	return driver.SaveState()
 }
 
+// SetRegion sets the region being used and saves the state file.
+func (driver *Driver) SetRegion(region *string) error {
+	driver.state.Region = region
+	return driver.SaveState()
+}
+
+// SetCloudFormationRole saves the cloud formation role to the state.
+func (driver *Driver) SetCloudFormationRole(role *string) error {
+	driver.state.CloudFormationRole = role
+	return driver.SaveState()
+}
+
 // DriverName used to self-identify. Allows for clean-ups etc.
 func (driver *Driver) DriverName() string {
 	return "cloudformation"
@@ -144,16 +156,24 @@ func (driver *Driver) DriverName() string {
 func (driver *Driver) getClientConfig() (*ClientConfig, error) {
 	if driver.clientConfig == nil {
 		sess := session.Must(session.NewSession())
+		err := driver.LoadState()
+		if err != nil {
+			return nil, err
+		}
+		if driver.state.Region == nil {
+			return nil, fmt.Errorf("region not set in driver state")
+		}
+
 		config := &aws.Config{
-			Region: aws.String(driver.region),
+			Region: aws.String(*driver.state.Region),
 		}
 
 		if driver.driverDebug {
 			config.WithLogLevel(aws.LogDebug)
 		}
 
-		if driver.cloudformationRole != nil {
-			config.Credentials = stscreds.NewCredentials(sess, *driver.cloudformationRole)
+		if driver.state.CloudFormationRole != nil {
+			config.Credentials = stscreds.NewCredentials(sess, *driver.state.CloudFormationRole)
 		}
 
 		driver.clientConfig = &ClientConfig{
@@ -604,7 +624,7 @@ func (driver *Driver) Remove() error {
 	}
 
 	_, err = cfClient.DeleteStack(&cloudformation.DeleteStackInput{
-		RoleARN:   driver.cloudformationRole,
+		RoleARN:   driver.state.CloudFormationRole,
 		StackName: driver.state.StackName,
 	})
 
@@ -652,10 +672,11 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	// We only set the role if it's set to some value. It's easier to work with
 	// nil as bunch of places in the API expect pointers.
 	if role != "" {
-		driver.cloudformationRole = &role
+		driver.SetCloudFormationRole(&role)
 	}
 
-	driver.region = flags.String("cloudformation-region")
+	region := flags.String("cloudformation-region")
+	driver.SetRegion(&region)
 
 	driver.instanceSSHUser = flags.String("cloudformation-instance-ssh-user")
 
