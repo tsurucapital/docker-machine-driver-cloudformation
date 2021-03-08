@@ -30,7 +30,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.8.0"
+var DriverVersion = "0.9.0"
 
 // ClientConfig comment
 type ClientConfig struct {
@@ -238,6 +238,7 @@ func (driver *Driver) Create() error {
 	CreateStackInput := cloudformation.CreateStackInput{}
 	// Before we create stack, we have to set then name and bunch of parameters.
 	CreateStackInput.SetStackName(driver.MachineName)
+	CreateStackInput.SetTemplateURL(driver.StackTemplateURL)
 	stackParameters := []*cloudformation.Parameter{
 		{
 			ParameterKey:   &driver.MachineNameParameterName,
