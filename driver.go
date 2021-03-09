@@ -30,7 +30,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.9.0"
+var DriverVersion = "0.10.0"
 
 // ClientConfig comment
 type ClientConfig struct {
@@ -60,6 +60,8 @@ type Driver struct {
 	InstanceID         *string
 	Region             *string
 	CloudFormationRole *string
+
+	CreateError *error
 
 	StackTags []*cloudformation.Tag
 }
@@ -255,10 +257,15 @@ func (driver *Driver) Create() error {
 	}
 	log.Debugf("Created %s stack, waiting for it to come up", *CreateStackInput.StackName)
 
+	// Past this point, do not return any error but instead set CreateError and
+	// return nil! See
+	// https://github.com/tsurucapital/docker-machine-driver-cloudformation/issues/1.
+
 	// Store the name so we can destroy it later.
 	driver.StackName = CreateStackInput.StackName
 	if err != nil {
-		return err
+		driver.CreateError = &err
+		return nil
 	}
 
 	describeStack := &cloudformation.DescribeStacksInput{
@@ -266,7 +273,9 @@ func (driver *Driver) Create() error {
 	}
 
 	if driver.StackCreationTimeout.Seconds() <= 0 {
-		return fmt.Errorf("Stack timeout duration has to be positive but got %f seconds", driver.StackCreationTimeout.Seconds())
+		err = fmt.Errorf("Stack timeout duration has to be positive but got %f seconds", driver.StackCreationTimeout.Seconds())
+		driver.CreateError = &err
+		return nil
 	}
 	ctx, cancelFn := context.WithTimeout(context.Background(), driver.StackCreationTimeout)
 
@@ -275,7 +284,8 @@ func (driver *Driver) Create() error {
 	err = cfClient.WaitUntilStackCreateCompleteWithContext(ctx, describeStack)
 	if err != nil {
 		log.Errorf("Failed to wait for %s stack.", *describeStack.StackName)
-		return err
+		driver.CreateError = &err
+		return nil
 	}
 	log.Debugf("Done waiting for %s stack.", *describeStack.StackName)
 
@@ -284,7 +294,8 @@ func (driver *Driver) Create() error {
 	stacksOutput, err := cfClient.DescribeStacks(describeStack)
 	if err != nil {
 		log.Errorf("Failed to describe %s stack.", *describeStack.StackName)
-		return err
+		driver.CreateError = &err
+		return nil
 	}
 	log.Debugf("Described %s stack.", *describeStack.StackName)
 
@@ -295,7 +306,9 @@ func (driver *Driver) Create() error {
 		outputs = stacksOutput.Stacks[0].Outputs
 		log.Debugf("Stack outputs: %+v", outputs)
 	} else {
-		return fmt.Errorf("no stacks returned with id %s", *stack.StackId)
+		err = fmt.Errorf("no stacks returned with id %s", *stack.StackId)
+		driver.CreateError = &err
+		return nil
 	}
 
 	var spotFleetID *cloudformation.Output
@@ -306,7 +319,9 @@ func (driver *Driver) Create() error {
 	}
 
 	if spotFleetID == nil {
-		return fmt.Errorf("stack output didn't contain %s output", driver.spotFleetIDOutputName)
+		err = fmt.Errorf("stack output didn't contain %s output", driver.spotFleetIDOutputName)
+		driver.CreateError = &err
+		return nil
 	}
 	log.Debugf("Spot fleet output determined to be %s", *spotFleetID.OutputValue)
 
@@ -332,7 +347,8 @@ func (driver *Driver) Create() error {
 		description, err := ec2Client.DescribeSpotFleetInstances(describeInstances)
 		if err != nil {
 			log.Errorf("Failed to describe spot fleet instances for %s", *spotFleetID.OutputValue)
-			return err
+			driver.CreateError = &err
+			return nil
 		}
 
 		if len(description.ActiveInstances) > 0 {
@@ -346,39 +362,24 @@ func (driver *Driver) Create() error {
 			attemptsLeft = attemptsLeft - 1
 			time.Sleep(sleepTime)
 		} else {
-			return fmt.Errorf("instance wasn't created within expected time, giving up")
+			err = fmt.Errorf("instance wasn't created within expected time, giving up")
+			driver.CreateError = &err
+			return nil
 		}
 	}
 
 	// If we got this far, we should finally have workerInstance available.
 	if workerInstance == nil {
-		return fmt.Errorf("internal error, expected worker instance to be available at this point")
+		err = fmt.Errorf("internal error, expected worker instance to be available at this point")
+		driver.CreateError = &err
+		return nil
 	}
 
 	driver.InstanceID = workerInstance.InstanceId
-
-	params := &ec2.DescribeInstancesInput{
-		InstanceIds: []*string{aws.String(*workerInstance.InstanceId)},
-	}
-	log.Debugf("describing instance %s", *workerInstance.InstanceId)
-	resp, err := ec2Client.DescribeInstances(params)
+	instance, err := driver.getInstance()
 	if err != nil {
-		log.Errorf("failed to describe instance %s", *workerInstance.InstanceId)
-		return err
-	}
-
-	var instance *ec2.Instance
-	for _, res := range resp.Reservations {
-		for _, i := range res.Instances {
-			if *i.InstanceId == *workerInstance.InstanceId {
-				instance = i
-				break
-			}
-		}
-	}
-
-	if instance == nil {
-		return fmt.Errorf("expected to find instance with ID %s but it was missing from %+v", *workerInstance.InstanceId, resp.Reservations)
+		driver.CreateError = &err
+		return nil
 	}
 
 	log.Debugf("Instance was launched with IP %s", *instance.PrivateIpAddress)
@@ -387,6 +388,43 @@ func (driver *Driver) Create() error {
 	driver.SSHUser = driver.InstanceSSHUser
 
 	return nil
+}
+
+func (driver *Driver) getInstance() (*ec2.Instance, error) {
+	if driver.InstanceID == nil {
+		return nil, fmt.Errorf("can't getInstance: we don't know the instance ID")
+	}
+
+	ec2Client, err := driver.getEc2Client()
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debugf("describing instance %s", *driver.InstanceID)
+	resp, err := ec2Client.DescribeInstances(&ec2.DescribeInstancesInput{
+		InstanceIds: []*string{driver.InstanceID},
+	})
+
+	if err != nil {
+		log.Errorf("failed to describe instance %s", *driver.InstanceID)
+		return nil, err
+	}
+
+	var instance *ec2.Instance
+	for _, res := range resp.Reservations {
+		for _, i := range res.Instances {
+			if *i.InstanceId == *driver.InstanceID {
+				instance = i
+				break
+			}
+		}
+	}
+
+	if instance == nil {
+		return nil, fmt.Errorf("expected to find instance with ID %s but it was missing from %+v", *driver.InstanceID, resp.Reservations)
+	}
+
+	return instance, nil
 }
 
 // GetCreateFlags encodes all the options to the driver
@@ -459,53 +497,49 @@ func (driver *Driver) GetCreateFlags() []mcnflag.Flag {
 
 // GetSSHHostname returns the hostname for SSH
 func (driver *Driver) GetSSHHostname() (string, error) {
-	if driver.IPAddress == "" {
-		return "", fmt.Errorf("we don't know the instance IP")
+	inst, err := driver.getInstance()
+	if err != nil {
+		return "", err
 	}
 
-	return driver.IPAddress, nil
+	if inst.PrivateIpAddress == nil {
+		return "", fmt.Errorf("No private IP for instance %v", *inst.InstanceId)
+	}
+
+	return *inst.PrivateIpAddress, nil
 }
 
 // GetState retrieves the status of the target Docker Machine instance in CloudControl.
 func (driver *Driver) GetState() (state.State, error) {
-	if driver.InstanceID == nil {
-		return state.None, fmt.Errorf("we don't know the instance ID so can't get the status")
+
+	// Spit out the smuggled create failure:
+	// https://github.com/tsurucapital/docker-machine-driver-cloudformation/issues/1
+	if driver.CreateError != nil {
+		return state.Error, *driver.CreateError
 	}
 
-	ec2Client, err := driver.getEc2Client()
+	inst, err := driver.getInstance()
 	if err != nil {
-		return state.None, err
+		return state.Error, err
 	}
 
-	resp, err := ec2Client.DescribeInstanceStatus(&ec2.DescribeInstanceStatusInput{
-		InstanceIds: []*string{driver.InstanceID},
-	})
-	if err != nil {
-		return state.None, err
-	}
-	if len(resp.InstanceStatuses) != 1 {
-		return state.None, fmt.Errorf("Expected exactly one instance status for %s but got %+v", *driver.InstanceID, resp.InstanceStatuses)
-	}
-	log.Debugf("Got instance statuses %+v", resp.InstanceStatuses)
-	code := *resp.InstanceStatuses[0].InstanceState.Code
-
-	// From AWS docs, 0 = pending, 16 = running, 32 = shutting-down, 48 =
-	// terminated, 64 = stopping and 80 = stopped
-	if code == 0 {
+	switch *inst.State.Name {
+	case ec2.InstanceStateNamePending:
 		return state.Starting, nil
-	} else if code == 16 {
+	case ec2.InstanceStateNameRunning:
 		return state.Running, nil
-	} else if code == 32 {
+	case ec2.InstanceStateNameStopping:
 		return state.Stopping, nil
-	} else if code == 48 {
-		return state.Stopped, nil
-	} else if code == 64 {
+	case ec2.InstanceStateNameShuttingDown:
 		return state.Stopping, nil
-	} else if code == 80 {
+	case ec2.InstanceStateNameStopped:
 		return state.Stopped, nil
+	case ec2.InstanceStateNameTerminated:
+		return state.Error, nil
+	default:
+		log.Warnf("unrecognized instance state: %v", *inst.State.Name)
+		return state.Error, nil
 	}
-
-	return state.None, fmt.Errorf("Unknown instance status code from AWS: %+v", resp.InstanceStatuses)
 }
 
 // GetURL returns docker daemon URL on the target machine
