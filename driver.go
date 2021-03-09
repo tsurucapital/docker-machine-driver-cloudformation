@@ -30,7 +30,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.10.0"
+var DriverVersion = "0.11.0"
 
 // ClientConfig comment
 type ClientConfig struct {
@@ -45,13 +45,12 @@ type Driver struct {
 	ec2                      *ec2.EC2
 	ssm                      *ssm.SSM
 	MachineNameParameterName string
-	spotFleetIDOutputName    string
+	SpotFleetIDOutputName    string
 	clientConfig             *ClientConfig
-	InstanceSSHUser          string
 	SSHPrivateKeyParameter   *string
 	SSHPublicKeyParameter    *string
 	StackCreationTimeout     time.Duration
-	driverDebug              bool
+	DriverDebug              bool
 	InstanceStartTimeout     time.Duration
 	InstanceStopTimeout      time.Duration
 
@@ -60,8 +59,6 @@ type Driver struct {
 	InstanceID         *string
 	Region             *string
 	CloudFormationRole *string
-
-	CreateError *error
 
 	StackTags []*cloudformation.Tag
 }
@@ -96,7 +93,7 @@ func (driver *Driver) getClientConfig() (*ClientConfig, error) {
 			Region: aws.String(*driver.Region),
 		}
 
-		if driver.driverDebug {
+		if driver.DriverDebug {
 			config.WithLogLevel(aws.LogDebug)
 		}
 
@@ -225,12 +222,6 @@ func (driver *Driver) Create() error {
 	}
 	log.Debugf("Wrote public part of SSH key to %s", publicDest)
 
-	ec2Client, err := driver.getEc2Client()
-	if err != nil {
-		log.Errorf("Failed to get EC2 client.")
-		return err
-	}
-
 	cfClient, err := driver.getCloudFormationClient()
 	if err != nil {
 		log.Errorf("Failed to get CloudFormation client.")
@@ -250,32 +241,43 @@ func (driver *Driver) Create() error {
 	CreateStackInput.SetParameters(stackParameters)
 	CreateStackInput.SetTags(driver.StackTags)
 
-	stack, err := cfClient.CreateStack(&CreateStackInput)
+	_, err = cfClient.CreateStack(&CreateStackInput)
 	if err != nil {
 		log.Errorf("Failed to create %s stack.", *CreateStackInput.StackName)
 		return err
 	}
-	log.Debugf("Created %s stack, waiting for it to come up", *CreateStackInput.StackName)
-
-	// Past this point, do not return any error but instead set CreateError and
-	// return nil! See
-	// https://github.com/tsurucapital/docker-machine-driver-cloudformation/issues/1.
+	log.Debugf("Created %s stack", *CreateStackInput.StackName)
 
 	// Store the name so we can destroy it later.
 	driver.StackName = CreateStackInput.StackName
-	if err != nil {
-		driver.CreateError = &err
-		return nil
+	return nil
+}
+
+func (driver *Driver) getInstanceID() (*string, error) {
+	// Short-circuit if we know the ID already
+	if driver.InstanceID != nil {
+		return driver.InstanceID, nil
 	}
 
+	if driver.StackName == nil {
+		return nil, fmt.Errorf("we don't have the stack name, we have no hope of getting instance ID")
+	}
+
+	// We have a stack name so find the fleet ID then the instance inside it.
+	// Wait until things are up if necessary.
+
 	describeStack := &cloudformation.DescribeStacksInput{
-		StackName: stack.StackId,
+		StackName: driver.StackName,
+	}
+
+	cfClient, err := driver.getCloudFormationClient()
+	if err != nil {
+		log.Errorf("Failed to get CloudFormation client.")
+		return nil, err
 	}
 
 	if driver.StackCreationTimeout.Seconds() <= 0 {
-		err = fmt.Errorf("Stack timeout duration has to be positive but got %f seconds", driver.StackCreationTimeout.Seconds())
-		driver.CreateError = &err
-		return nil
+		return nil, fmt.Errorf("Stack timeout duration has to be positive but got %f seconds", driver.StackCreationTimeout.Seconds())
 	}
 	ctx, cancelFn := context.WithTimeout(context.Background(), driver.StackCreationTimeout)
 
@@ -284,8 +286,7 @@ func (driver *Driver) Create() error {
 	err = cfClient.WaitUntilStackCreateCompleteWithContext(ctx, describeStack)
 	if err != nil {
 		log.Errorf("Failed to wait for %s stack.", *describeStack.StackName)
-		driver.CreateError = &err
-		return nil
+		return nil, err
 	}
 	log.Debugf("Done waiting for %s stack.", *describeStack.StackName)
 
@@ -294,8 +295,7 @@ func (driver *Driver) Create() error {
 	stacksOutput, err := cfClient.DescribeStacks(describeStack)
 	if err != nil {
 		log.Errorf("Failed to describe %s stack.", *describeStack.StackName)
-		driver.CreateError = &err
-		return nil
+		return nil, err
 	}
 	log.Debugf("Described %s stack.", *describeStack.StackName)
 
@@ -306,22 +306,18 @@ func (driver *Driver) Create() error {
 		outputs = stacksOutput.Stacks[0].Outputs
 		log.Debugf("Stack outputs: %+v", outputs)
 	} else {
-		err = fmt.Errorf("no stacks returned with id %s", *stack.StackId)
-		driver.CreateError = &err
-		return nil
+		return nil, fmt.Errorf("no stacks returned with name %s", *driver.StackName)
 	}
 
 	var spotFleetID *cloudformation.Output
 	for _, output := range outputs {
-		if *output.OutputKey == driver.spotFleetIDOutputName {
+		if *output.OutputKey == driver.SpotFleetIDOutputName {
 			spotFleetID = output
 		}
 	}
 
 	if spotFleetID == nil {
-		err = fmt.Errorf("stack output didn't contain %s output", driver.spotFleetIDOutputName)
-		driver.CreateError = &err
-		return nil
+		return nil, fmt.Errorf("stack output didn't contain %s output", driver.SpotFleetIDOutputName)
 	}
 	log.Debugf("Spot fleet output determined to be %s", *spotFleetID.OutputValue)
 
@@ -342,13 +338,18 @@ func (driver *Driver) Create() error {
 	// docker-machine imposing some kind of time-out...
 	attemptsLeft := 12 * 10
 
+	ec2Client, err := driver.getEc2Client()
+	if err != nil {
+		log.Errorf("Failed to get EC2 client.")
+		return nil, err
+	}
+
 	for true {
 		log.Debugf("Describing spot fleet instances for %s", *spotFleetID.OutputValue)
 		description, err := ec2Client.DescribeSpotFleetInstances(describeInstances)
 		if err != nil {
 			log.Errorf("Failed to describe spot fleet instances for %s", *spotFleetID.OutputValue)
-			driver.CreateError = &err
-			return nil
+			return nil, err
 		}
 
 		if len(description.ActiveInstances) > 0 {
@@ -362,37 +363,25 @@ func (driver *Driver) Create() error {
 			attemptsLeft = attemptsLeft - 1
 			time.Sleep(sleepTime)
 		} else {
-			err = fmt.Errorf("instance wasn't created within expected time, giving up")
-			driver.CreateError = &err
-			return nil
+			return nil, fmt.Errorf("instance wasn't created within expected time, giving up")
 		}
 	}
 
 	// If we got this far, we should finally have workerInstance available.
 	if workerInstance == nil {
-		err = fmt.Errorf("internal error, expected worker instance to be available at this point")
-		driver.CreateError = &err
-		return nil
+		return nil, fmt.Errorf("internal error, expected worker instance to be available at this point")
 	}
 
 	driver.InstanceID = workerInstance.InstanceId
-	instance, err := driver.getInstance()
-	if err != nil {
-		driver.CreateError = &err
-		return nil
-	}
 
-	log.Debugf("Instance was launched with IP %s", *instance.PrivateIpAddress)
+	return driver.InstanceID, nil
 
-	driver.IPAddress = *instance.PrivateIpAddress
-	driver.SSHUser = driver.InstanceSSHUser
-
-	return nil
 }
 
 func (driver *Driver) getInstance() (*ec2.Instance, error) {
-	if driver.InstanceID == nil {
-		return nil, fmt.Errorf("can't getInstance: we don't know the instance ID")
+	instanceID, err := driver.getInstanceID()
+	if err != nil {
+		return nil, err
 	}
 
 	ec2Client, err := driver.getEc2Client()
@@ -400,20 +389,20 @@ func (driver *Driver) getInstance() (*ec2.Instance, error) {
 		return nil, err
 	}
 
-	log.Debugf("describing instance %s", *driver.InstanceID)
+	log.Debugf("describing instance %s", *instanceID)
 	resp, err := ec2Client.DescribeInstances(&ec2.DescribeInstancesInput{
-		InstanceIds: []*string{driver.InstanceID},
+		InstanceIds: []*string{instanceID},
 	})
 
 	if err != nil {
-		log.Errorf("failed to describe instance %s", *driver.InstanceID)
+		log.Errorf("failed to describe instance %s", *instanceID)
 		return nil, err
 	}
 
 	var instance *ec2.Instance
 	for _, res := range resp.Reservations {
 		for _, i := range res.Instances {
-			if *i.InstanceId == *driver.InstanceID {
+			if *i.InstanceId == *instanceID {
 				instance = i
 				break
 			}
@@ -421,7 +410,7 @@ func (driver *Driver) getInstance() (*ec2.Instance, error) {
 	}
 
 	if instance == nil {
-		return nil, fmt.Errorf("expected to find instance with ID %s but it was missing from %+v", *driver.InstanceID, resp.Reservations)
+		return nil, fmt.Errorf("expected to find instance with ID %s but it was missing from %+v", *instanceID, resp.Reservations)
 	}
 
 	return instance, nil
@@ -511,13 +500,6 @@ func (driver *Driver) GetSSHHostname() (string, error) {
 
 // GetState retrieves the status of the target Docker Machine instance in CloudControl.
 func (driver *Driver) GetState() (state.State, error) {
-
-	// Spit out the smuggled create failure:
-	// https://github.com/tsurucapital/docker-machine-driver-cloudformation/issues/1
-	if driver.CreateError != nil {
-		return state.Error, *driver.CreateError
-	}
-
 	inst, err := driver.getInstance()
 	if err != nil {
 		return state.Error, err
@@ -586,7 +568,6 @@ func (driver *Driver) Remove() error {
 		return err
 	}
 
-	driver.IPAddress = ""
 	driver.StackName = nil
 	driver.InstanceID = nil
 
@@ -595,23 +576,16 @@ func (driver *Driver) Remove() error {
 
 // Restart the target machine.
 func (driver *Driver) Restart() error {
-	// We can check if machine is running but not bothering right now... We'll
-	// just check if we know of one at least.
-	if driver.IPAddress == "" {
-		return fmt.Errorf("we don't know the instance IP so we can't reboot")
-	}
-
 	_, err := drivers.RunSSHCommandFromDriver(driver, "sudo shutdown -r now")
-
 	return err
 }
 
 // SetConfigFromFlags assigns and verifies the command-line arguments presented to the driver.
 func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
-	driver.driverDebug = flags.Bool("cloudformation-driver-debug")
+	driver.DriverDebug = flags.Bool("cloudformation-driver-debug")
 
 	// Enable ALL logging if MACHINE_DEBUG is set
-	if os.Getenv("MACHINE_DEBUG") != "" || driver.driverDebug {
+	if os.Getenv("MACHINE_DEBUG") != "" || driver.DriverDebug {
 		stdlog.SetOutput(os.Stderr)
 	}
 
@@ -629,11 +603,11 @@ func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	region := flags.String("cloudformation-region")
 	driver.Region = &region
 
-	driver.InstanceSSHUser = flags.String("cloudformation-instance-ssh-user")
+	driver.SSHUser = flags.String("cloudformation-instance-ssh-user")
 
 	driver.MachineNameParameterName = flags.String("cloudformation-machine-name-parameter-name")
 
-	driver.spotFleetIDOutputName = flags.String("cloudformation-spot-fleet-id-output-name")
+	driver.SpotFleetIDOutputName = flags.String("cloudformation-spot-fleet-id-output-name")
 
 	private := flags.String("cloudformation-ssh-private-key-parameter")
 	if private != "" {
@@ -682,8 +656,9 @@ func ParseTag(input string) (*cloudformation.Tag, error) {
 
 // Start the target machine.
 func (driver *Driver) Start() error {
-	if driver.InstanceID == nil {
-		return fmt.Errorf("no instance ID found in the state")
+	instanceID, err := driver.getInstanceID()
+	if err != nil {
+		return err
 	}
 
 	ec2Client, err := driver.getEc2Client()
@@ -692,7 +667,7 @@ func (driver *Driver) Start() error {
 	}
 
 	_, err = ec2Client.StartInstances(&ec2.StartInstancesInput{
-		InstanceIds: []*string{driver.InstanceID},
+		InstanceIds: []*string{instanceID},
 	})
 	if err != nil {
 		return err
@@ -705,7 +680,7 @@ func (driver *Driver) Start() error {
 	defer cancelFn()
 
 	return ec2Client.WaitUntilInstanceRunningWithContext(ctx, &ec2.DescribeInstancesInput{
-		InstanceIds: []*string{driver.InstanceID},
+		InstanceIds: []*string{instanceID},
 	})
 }
 
@@ -717,8 +692,9 @@ func (driver *Driver) Stop() error {
 // StopInstance stops underlying EC2 instance, forcefully or not depending on
 // what the user wanted.
 func (driver *Driver) StopInstance(force bool) error {
-	if driver.InstanceID == nil {
-		return fmt.Errorf("no instance ID found in the state")
+	instanceID, err := driver.getInstanceID()
+	if err != nil {
+		return err
 	}
 
 	ec2Client, err := driver.getEc2Client()
@@ -728,7 +704,7 @@ func (driver *Driver) StopInstance(force bool) error {
 
 	_, err = ec2Client.StopInstances(&ec2.StopInstancesInput{
 		Force:       &force,
-		InstanceIds: []*string{driver.InstanceID},
+		InstanceIds: []*string{instanceID},
 	})
 	if err != nil {
 		return err
@@ -742,6 +718,6 @@ func (driver *Driver) StopInstance(force bool) error {
 
 	// Might want a timeout flag here.
 	return ec2Client.WaitUntilInstanceStoppedWithContext(ctx, &ec2.DescribeInstancesInput{
-		InstanceIds: []*string{driver.InstanceID},
+		InstanceIds: []*string{instanceID},
 	})
 }
