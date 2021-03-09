@@ -30,7 +30,7 @@ import (
 )
 
 // DriverVersion of this driver
-var DriverVersion = "0.11.0"
+var DriverVersion = "0.12.0"
 
 // ClientConfig comment
 type ClientConfig struct {
@@ -50,7 +50,7 @@ type Driver struct {
 	SSHPrivateKeyParameter   *string
 	SSHPublicKeyParameter    *string
 	StackCreationTimeout     time.Duration
-	DriverDebug              bool
+	driverDebug              bool
 	InstanceStartTimeout     time.Duration
 	InstanceStopTimeout      time.Duration
 
@@ -93,7 +93,7 @@ func (driver *Driver) getClientConfig() (*ClientConfig, error) {
 			Region: aws.String(*driver.Region),
 		}
 
-		if driver.DriverDebug {
+		if driver.driverDebug {
 			config.WithLogLevel(aws.LogDebug)
 		}
 
@@ -484,8 +484,12 @@ func (driver *Driver) GetCreateFlags() []mcnflag.Flag {
 	}
 }
 
-// GetSSHHostname returns the hostname for SSH
-func (driver *Driver) GetSSHHostname() (string, error) {
+// GetIP fetches address of the instance if it's not set.
+func (driver *Driver) GetIP() (string, error) {
+	if driver.IPAddress != "" {
+		return driver.IPAddress, nil
+	}
+
 	inst, err := driver.getInstance()
 	if err != nil {
 		return "", err
@@ -495,7 +499,13 @@ func (driver *Driver) GetSSHHostname() (string, error) {
 		return "", fmt.Errorf("No private IP for instance %v", *inst.InstanceId)
 	}
 
+	driver.IPAddress = *inst.PrivateIpAddress
 	return *inst.PrivateIpAddress, nil
+}
+
+// GetSSHHostname returns the hostname for SSH
+func (driver *Driver) GetSSHHostname() (string, error) {
+	return driver.GetIP()
 }
 
 // GetState retrieves the status of the target Docker Machine instance in CloudControl.
@@ -582,10 +592,10 @@ func (driver *Driver) Restart() error {
 
 // SetConfigFromFlags assigns and verifies the command-line arguments presented to the driver.
 func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
-	driver.DriverDebug = flags.Bool("cloudformation-driver-debug")
+	driver.driverDebug = flags.Bool("cloudformation-driver-debug")
 
 	// Enable ALL logging if MACHINE_DEBUG is set
-	if os.Getenv("MACHINE_DEBUG") != "" || driver.DriverDebug {
+	if os.Getenv("MACHINE_DEBUG") != "" || driver.driverDebug {
 		stdlog.SetOutput(os.Stderr)
 	}
 
